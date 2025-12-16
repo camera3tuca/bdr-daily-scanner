@@ -1,7 +1,7 @@
 # ==========================================================
 # SCANNER DIÁRIO DE BDRs
 # Tendência + Momentum + Volume
-# Compatível com Streamlit Cloud
+# Streamlit Cloud - VERSÃO BLINDADA
 # ==========================================================
 
 import streamlit as st
@@ -9,8 +9,6 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
-from datetime import datetime, timedelta
-from tqdm import tqdm
 
 # ----------------------------------------------------------
 # CONFIGURAÇÃO DA PÁGINA
@@ -27,7 +25,6 @@ st.caption("Tendência + Momentum + Volume | Execução diária")
 # CONFIGURAÇÕES
 # ----------------------------------------------------------
 BRAPI_API_TOKEN = st.secrets["BRAPI_API_TOKEN"]
-
 BRAPI_LIST_URL = "https://brapi.dev/api/quote/list"
 
 # ----------------------------------------------------------
@@ -36,19 +33,11 @@ BRAPI_LIST_URL = "https://brapi.dev/api/quote/list"
 st.sidebar.header("Parâmetros")
 
 min_score = st.sidebar.slider(
-    "Score mínimo",
-    min_value=20,
-    max_value=90,
-    value=40,
-    step=5
+    "Score mínimo", 20, 90, 40, 5
 )
 
 max_bdrs = st.sidebar.slider(
-    "Quantidade de BDRs analisadas",
-    min_value=50,
-    max_value=150,
-    value=100,
-    step=10
+    "Quantidade de BDRs analisadas", 50, 150, 100, 10
 )
 
 run_button = st.sidebar.button("Executar Scanner")
@@ -58,17 +47,17 @@ run_button = st.sidebar.button("Executar Scanner")
 # ----------------------------------------------------------
 @st.cache_data(ttl=3600)
 def get_bdrs():
-    response = requests.get(
+    r = requests.get(
         BRAPI_LIST_URL,
         params={"token": BRAPI_API_TOKEN},
         timeout=30
     )
-    data = response.json()["stocks"]
+    data = r.json().get("stocks", [])
 
     bdrs = [
         item["stock"][:-2]
         for item in data
-        if item["stock"].endswith(("34", "35"))
+        if item.get("stock", "").endswith(("34", "35"))
     ]
 
     return list(set(bdrs))
@@ -76,16 +65,24 @@ def get_bdrs():
 
 @st.cache_data(ttl=3600)
 def get_price_data(ticker):
-    df = yf.download(
-        ticker,
-        period="6mo",
-        interval="1d",
-        progress=False
-    )
+    try:
+        df = yf.download(
+            ticker,
+            period="6mo",
+            interval="1d",
+            progress=False,
+            auto_adjust=True
+        )
+    except Exception:
+        return None
+
+    if not isinstance(df, pd.DataFrame):
+        return None
 
     if df.empty or len(df) < 60:
         return None
 
+    # Indicadores
     df["EMA21"] = df["Close"].ewm(span=21).mean()
     df["EMA50"] = df["Close"].ewm(span=50).mean()
 
@@ -97,23 +94,38 @@ def get_price_data(ticker):
 
     df["Volume_MA"] = df["Volume"].rolling(20).mean()
 
-    return df.dropna()
+    df = df.dropna()
+
+    if df.empty or len(df) < 10:
+        return None
+
+    return df
 
 
 def score_asset(df):
-    reasons = []
-    score = 0
+    # 🔒 Blindagem absoluta
+    if not isinstance(df, pd.DataFrame):
+        return 0, [], None
+
+    if df.empty or len(df) < 60:
+        return 0, [], None
 
     last = df.iloc[-1]
 
-    close = float(last["Close"])
-    ema21 = float(last["EMA21"])
-    ema50 = float(last["EMA50"])
-    rsi = float(last["RSI"])
-    volume = float(last["Volume"])
-    vol_ma = float(last["Volume_MA"])
+    try:
+        close = float(last["Close"])
+        ema21 = float(last["EMA21"])
+        ema50 = float(last["EMA50"])
+        rsi = float(last["RSI"])
+        volume = float(last["Volume"])
+        vol_ma = float(last["Volume_MA"])
+    except Exception:
+        return 0, [], None
 
     slope = df["EMA21"].iloc[-5:].diff().mean()
+
+    score = 0
+    reasons = []
 
     # Tendência
     if close > ema21 and ema21 > ema50 and slope > 0:
@@ -146,8 +158,8 @@ if run_button:
     bdrs = get_bdrs()[:max_bdrs]
 
     results = []
-
     progress = st.progress(0)
+
     total = len(bdrs)
 
     for i, ticker in enumerate(bdrs):
@@ -158,6 +170,8 @@ if run_button:
             continue
 
         score, reasons, last = score_asset(df)
+        if last is None:
+            continue
 
         if score >= min_score:
             results.append({
@@ -175,7 +189,6 @@ if run_button:
         df_results = pd.DataFrame(results).sort_values(
             by="Score", ascending=False
         )
-
         st.success(f"{len(df_results)} BDRs encontradas")
         st.dataframe(df_results, use_container_width=True)
     else:
