@@ -1,163 +1,183 @@
-# ================================================================
-# app.py
-# SCANNER DIÁRIO DE BDRs - STREAMLIT CLOUD
-# Tendência + Momentum + Volume | 100+ BDRs
-# ================================================================
+# ==========================================================
+# SCANNER DIÁRIO DE BDRs
+# Tendência + Momentum + Volume
+# Compatível com Streamlit Cloud
+# ==========================================================
 
 import streamlit as st
-import os
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
+from datetime import datetime, timedelta
 from tqdm import tqdm
-from datetime import datetime
-import warnings
-warnings.filterwarnings('ignore')
 
-# ================================================================
-# CONFIGURAÇÕES GERAIS
-# ================================================================
-LOOKBACK_DAYS = 180
-MIN_SCORE_DEFAULT = 60
-
-BRAPI_API_TOKEN = os.getenv("BRAPI_API_TOKEN")
-
-if not BRAPI_API_TOKEN:
-    st.error("API token da BRAPI não configurado. Configure em Settings > Secrets.")
-    st.stop()
-
-# ================================================================
-# FUNÇÕES AUXILIARES
-# ================================================================
-@st.cache_data(ttl=3600)
-def get_top_bdrs(limit=120):
-    url = f"https://brapi.dev/api/quote/list?token={BRAPI_API_TOKEN}"
-    r = requests.get(url, timeout=30)
-    data = r.json().get('stocks', [])
-
-    df = pd.DataFrame(data)
-    df = df[df['stock'].str.endswith(('34', '35'))]
-    df['us'] = df['stock'].str[:-2]
-    df = df.sort_values('volume', ascending=False)
-
-    return df['us'].head(limit).tolist()
-
-
-@st.cache_data(ttl=3600)
-def download_data(ticker):
-    df = yf.download(ticker, period=f"{LOOKBACK_DAYS}d", progress=False)
-    if df.empty or len(df) < 80:
-        return None
-    return df
-
-
-def add_indicators(df):
-    df = df.copy()
-
-    df['EMA21'] = df['Close'].ewm(span=21).mean()
-    df['EMA50'] = df['Close'].ewm(span=50).mean()
-
-    delta = df['Close'].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = -delta.clip(upper=0).rolling(14).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    df['VOL_MA'] = df['Volume'].rolling(20).mean()
-
-    tr = pd.concat([
-        df['High'] - df['Low'],
-        (df['High'] - df['Close'].shift()).abs(),
-        (df['Low'] - df['Close'].shift()).abs()
-    ], axis=1)
-    df['ATR'] = tr.max(axis=1).rolling(14).mean()
-
-    return df
-
-
-def score_asset(df):
-    last = df.iloc[-1]
-    score = 0
-    reasons = []
-
-    slope = df['EMA21'].diff(5).iloc[-1]
-
-    if last['Close'] > last['EMA21'] > last['EMA50'] and slope > 0:
-        score += 40
-        reasons.append('Tendência de alta')
-
-    if 40 <= last['RSI'] <= 65:
-        score += 20
-        reasons.append('RSI saudável')
-
-    if last['Volume'] > last['VOL_MA']:
-        score += 15
-        reasons.append('Volume acima da média')
-
-    if last['Close'] > df['Close'].rolling(20).max().iloc[-2]:
-        score += 15
-        reasons.append('Breakout 20d')
-
-    return score, reasons, last
-
-# ================================================================
-# INTERFACE STREAMLIT
-# ================================================================
-st.set_page_config(page_title="Scanner Diário de BDRs", layout="wide")
+# ----------------------------------------------------------
+# CONFIGURAÇÃO DA PÁGINA
+# ----------------------------------------------------------
+st.set_page_config(
+    page_title="Scanner Diário de BDRs",
+    layout="wide"
+)
 
 st.title("Scanner Diário de BDRs")
 st.caption("Tendência + Momentum + Volume | Execução diária")
 
-col1, col2 = st.columns(2)
+# ----------------------------------------------------------
+# CONFIGURAÇÕES
+# ----------------------------------------------------------
+BRAPI_API_TOKEN = st.secrets["BRAPI_API_TOKEN"]
 
-with col1:
-    min_score = st.slider("Score mínimo", 40, 90, MIN_SCORE_DEFAULT, 5)
+BRAPI_LIST_URL = "https://brapi.dev/api/quote/list"
 
-with col2:
-    max_bdrs = st.slider("Quantidade de BDRs analisadas", 50, 150, 120, 10)
+# ----------------------------------------------------------
+# SIDEBAR
+# ----------------------------------------------------------
+st.sidebar.header("Parâmetros")
 
-run = st.button("Executar Scanner")
+min_score = st.sidebar.slider(
+    "Score mínimo",
+    min_value=20,
+    max_value=90,
+    value=40,
+    step=5
+)
 
-# ================================================================
-# EXECUÇÃO
-# ================================================================
-if run:
+max_bdrs = st.sidebar.slider(
+    "Quantidade de BDRs analisadas",
+    min_value=50,
+    max_value=150,
+    value=100,
+    step=10
+)
+
+run_button = st.sidebar.button("Executar Scanner")
+
+# ----------------------------------------------------------
+# FUNÇÕES
+# ----------------------------------------------------------
+@st.cache_data(ttl=3600)
+def get_bdrs():
+    response = requests.get(
+        BRAPI_LIST_URL,
+        params={"token": BRAPI_API_TOKEN},
+        timeout=30
+    )
+    data = response.json()["stocks"]
+
+    bdrs = [
+        item["stock"][:-2]
+        for item in data
+        if item["stock"].endswith(("34", "35"))
+    ]
+
+    return list(set(bdrs))
+
+
+@st.cache_data(ttl=3600)
+def get_price_data(ticker):
+    df = yf.download(
+        ticker,
+        period="6mo",
+        interval="1d",
+        progress=False
+    )
+
+    if df.empty or len(df) < 60:
+        return None
+
+    df["EMA21"] = df["Close"].ewm(span=21).mean()
+    df["EMA50"] = df["Close"].ewm(span=50).mean()
+
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    rs = gain / loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    df["Volume_MA"] = df["Volume"].rolling(20).mean()
+
+    return df.dropna()
+
+
+def score_asset(df):
+    reasons = []
+    score = 0
+
+    last = df.iloc[-1]
+
+    close = float(last["Close"])
+    ema21 = float(last["EMA21"])
+    ema50 = float(last["EMA50"])
+    rsi = float(last["RSI"])
+    volume = float(last["Volume"])
+    vol_ma = float(last["Volume_MA"])
+
+    slope = df["EMA21"].iloc[-5:].diff().mean()
+
+    # Tendência
+    if close > ema21 and ema21 > ema50 and slope > 0:
+        score += 40
+        reasons.append("Tendência de alta (EMA21 > EMA50)")
+    elif close < ema21:
+        score -= 20
+
+    # Momentum
+    if rsi < 35:
+        score += 20
+        reasons.append("RSI em sobrevenda")
+    elif rsi > 70:
+        score -= 20
+
+    # Volume
+    if volume > vol_ma:
+        score += 20
+        reasons.append("Volume acima da média")
+
+    return score, reasons, last
+
+
+# ----------------------------------------------------------
+# EXECUÇÃO DO SCANNER
+# ----------------------------------------------------------
+if run_button:
     st.info("Buscando BDRs mais líquidas...")
-    tickers = get_top_bdrs(limit=max_bdrs)
+
+    bdrs = get_bdrs()[:max_bdrs]
 
     results = []
-    progress = st.progress(0)
 
-    for i, t in enumerate(tickers):
-        df = download_data(t)
+    progress = st.progress(0)
+    total = len(bdrs)
+
+    for i, ticker in enumerate(bdrs):
+        progress.progress((i + 1) / total)
+
+        df = get_price_data(ticker)
         if df is None:
-            progress.progress((i + 1) / len(tickers))
             continue
 
-        df = add_indicators(df)
         score, reasons, last = score_asset(df)
 
         if score >= min_score:
             results.append({
-                'Ticker': t,
-                'Preço': round(last['Close'], 2),
-                'Score': score,
-                'RSI': round(last['RSI'], 1),
-                'ATR': round(last['ATR'], 2),
-                'Motivos': ', '.join(reasons)
+                "BDR": ticker,
+                "Score": score,
+                "Preço": round(float(last["Close"]), 2),
+                "RSI": round(float(last["RSI"]), 1),
+                "Volume": int(last["Volume"]),
+                "Motivos": " | ".join(reasons)
             })
 
-        progress.progress((i + 1) / len(tickers))
+    progress.empty()
 
     if results:
-        df_res = pd.DataFrame(results).sort_values('Score', ascending=False)
-        st.success(f"{len(df_res)} ativos encontrados")
-        st.dataframe(df_res, use_container_width=True)
+        df_results = pd.DataFrame(results).sort_values(
+            by="Score", ascending=False
+        )
 
-        csv = df_res.to_csv(index=False).encode('utf-8')
-        st.download_button("Baixar CSV", csv, "scanner_bdrs_diario.csv", "text/csv")
+        st.success(f"{len(df_results)} BDRs encontradas")
+        st.dataframe(df_results, use_container_width=True)
     else:
-        st.warning("Nenhum ativo atingiu o score mínimo hoje.")
-
-st.caption(f"Última execução: {datetime.now().strftime('%d/%m/%Y %H:%M:%S')}")
+        st.warning("Nenhuma BDR atingiu o score mínimo hoje.")
+        
