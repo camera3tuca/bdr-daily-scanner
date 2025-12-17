@@ -5,21 +5,17 @@ import yfinance as yf
 import plotly.graph_objects as go
 
 # =========================
-# CONFIGURAÇÕES
+# CONFIG
 # =========================
 st.set_page_config(page_title="Scanner Profissional de BDRs", layout="wide")
 
 BDRS = [
-    "AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "NFLX", "AMD", "INTC",
-    "JPM", "BAC", "WFC", "GS", "MS",
-    "JNJ", "PFE", "MRK", "ABBV", "LLY",
-    "KO", "PEP", "MCD", "NKE", "DIS",
-    "V", "MA", "PYPL", "ADBE", "CRM",
-    "ORCL", "IBM", "CSCO", "QCOM", "AVGO",
-    "BA", "GE", "CAT", "DE", "MMM",
-    "XOM", "CVX", "SLB", "COP", "BP",
-    "WMT", "COST", "TGT", "HD", "LOW",
-] * 6  # ≈300 ativos
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","TSLA","NFLX","AMD","INTC",
+    "JPM","BAC","WFC","GS","MS","JNJ","PFE","MRK","ABBV","LLY",
+    "KO","PEP","MCD","NKE","DIS","V","MA","PYPL","ADBE","CRM",
+    "ORCL","IBM","CSCO","QCOM","AVGO","BA","GE","CAT","DE","MMM",
+    "XOM","CVX","SLB","COP","BP","WMT","COST","TGT","HD","LOW"
+] * 6  # ~300
 
 PERIOD = "1y"
 INTERVAL = "1d"
@@ -27,7 +23,7 @@ INTERVAL = "1d"
 # =========================
 # INDICADORES
 # =========================
-def indicators(df):
+def calc_indicators(df):
     df["EMA21"] = df["Close"].ewm(span=21).mean()
     df["EMA50"] = df["Close"].ewm(span=50).mean()
     df["EMA200"] = df["Close"].ewm(span=200).mean()
@@ -40,80 +36,79 @@ def indicators(df):
 
     df["Vol_Mean"] = df["Volume"].rolling(20).mean()
     df["Max20"] = df["High"].rolling(20).max()
-    df["Max50"] = df["High"].rolling(50).max()
 
     return df.dropna()
 
 # =========================
-# SCORE ENGINE PROFISSIONAL
+# SCORE ENGINE
 # =========================
 def score_asset(df):
-    if df.empty or len(df) < 210:
-        return 0, [], None
+    if len(df) < 210:
+        return None
 
     last = df.iloc[-1]
     prev = df.iloc[-2]
 
-    score = 0
-    reasons = []
+    scores = {
+        "Tendência": 0,
+        "Momentum": 0,
+        "Volume": 0,
+        "Breakout": 0
+    }
 
-    # ---- Tendência (0–30)
     if last.Close > last.EMA21 > last.EMA50 > last.EMA200:
-        score += 30
-        reasons.append("Tendência forte (EMAs alinhadas)")
+        scores["Tendência"] = 30
 
-    # ---- Momentum (0–25)
     if 55 <= last.RSI <= 70 and last.RSI > prev.RSI:
-        score += 25
-        reasons.append("Momentum saudável (RSI)")
+        scores["Momentum"] = 25
 
-    # ---- Volume Inteligente (0–20)
     if last.Volume > last.Vol_Mean:
-        score += 20
-        reasons.append("Volume acima da média")
+        scores["Volume"] = 20
 
-    # ---- Breakout (0–25)
     if last.Close > prev.Max20 and last.Volume > last.Vol_Mean:
-        score += 25
-        reasons.append("Breakout confirmado")
+        scores["Breakout"] = 25
 
-    return score, reasons, last
+    total = sum(scores.values())
+
+    return {
+        "Preço": round(last.Close, 2),
+        "RSI": round(last.RSI, 1),
+        "Volume": int(last.Volume),
+        "Score": total,
+        **scores
+    }
 
 # =========================
-# GRÁFICO PROFISSIONAL
+# GRÁFICO
 # =========================
 def plot_chart(df, ticker):
     fig = go.Figure()
-
     fig.add_candlestick(
         x=df.index,
         open=df["Open"],
         high=df["High"],
         low=df["Low"],
-        close=df["Close"],
-        name="Preço"
+        close=df["Close"]
     )
-
     fig.add_trace(go.Scatter(x=df.index, y=df["EMA21"], name="EMA21"))
     fig.add_trace(go.Scatter(x=df.index, y=df["EMA50"], name="EMA50"))
     fig.add_trace(go.Scatter(x=df.index, y=df["EMA200"], name="EMA200"))
 
     fig.update_layout(
-        title=f"{ticker} - Gráfico Técnico",
-        height=600,
+        title=f"{ticker} – Gráfico Técnico",
+        height=550,
         xaxis_rangeslider_visible=False
     )
-
     st.plotly_chart(fig, use_container_width=True)
 
 # =========================
 # INTERFACE
 # =========================
 st.title("Scanner Profissional de BDRs")
-st.caption("Ranking + Tendência + Momentum + Volume + Breakout | Execução diária")
+st.caption("Ranking + Estratégias | Execução diária")
 
 with st.sidebar:
-    score_min = st.slider("Score mínimo", 20, 90, 40)
+    score_min = st.slider("Score mínimo (destaque)", 20, 90, 40)
     qtd = st.slider("Quantidade de BDRs analisadas", 50, 300, 150)
     run = st.button("Executar Scanner")
 
@@ -121,10 +116,9 @@ with st.sidebar:
 # EXECUÇÃO
 # =========================
 if run:
-    st.info("Buscando BDRs mais líquidas...")
-
-    results = []
-    data_cache = {}
+    st.info("Processando BDRs...")
+    rows = []
+    cache = {}
 
     for ticker in BDRS[:qtd]:
         try:
@@ -132,34 +126,43 @@ if run:
             if df.empty:
                 continue
 
-            df = indicators(df)
-            score, reasons, last = score_asset(df)
-
-            if last is None or score < score_min:
+            df = calc_indicators(df)
+            result = score_asset(df)
+            if result is None:
                 continue
 
-            results.append({
-                "BDR": ticker,
-                "Score": score,
-                "Preço": round(last.Close, 2),
-                "RSI": round(last.RSI, 1),
-                "Volume": int(last.Volume),
-                "Motivos": " | ".join(reasons)
-            })
-
-            data_cache[ticker] = df
+            rows.append({"BDR": ticker, **result})
+            cache[ticker] = df
 
         except Exception:
             continue
 
-    if not results:
-        st.warning("Nenhuma BDR encontrada com os critérios atuais.")
+    df_all = pd.DataFrame(rows).sort_values("Score", ascending=False)
+
+    if df_all.empty:
+        st.warning("Sem dados suficientes no momento.")
     else:
-        df_res = pd.DataFrame(results).sort_values("Score", ascending=False)
-        st.success(f"{len(df_res)} BDRs encontradas")
+        tab1, tab2, tab3, tab4 = st.tabs(
+            ["Ranking Geral", "Tendência", "Breakout", "Momentum"]
+        )
 
-        st.dataframe(df_res, use_container_width=True)
+        with tab1:
+            st.dataframe(df_all.head(20), use_container_width=True)
 
-        selected = st.selectbox("Selecionar BDR para gráfico", df_res["BDR"])
-        plot_chart(data_cache[selected], selected)
-        
+        with tab2:
+            st.dataframe(df_all[df_all["Tendência"] > 0], use_container_width=True)
+
+        with tab3:
+            st.dataframe(df_all[df_all["Breakout"] > 0], use_container_width=True)
+
+        with tab4:
+            st.dataframe(df_all[df_all["Momentum"] > 0], use_container_width=True)
+
+        destaque = df_all[df_all["Score"] >= score_min]
+
+        if not destaque.empty:
+            st.success(f"{len(destaque)} BDRs com score ≥ {score_min}")
+
+        selected = st.selectbox("Selecionar BDR para gráfico", df_all["BDR"])
+        plot_chart(cache[selected], selected)
+    
