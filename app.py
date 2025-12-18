@@ -1,149 +1,193 @@
+# ==============================================================================
+# SCANNER PROFISSIONAL DE BDRs – STREAMLIT
+# Tendência + Momentum + Volume + Eventos + Notícias
+# Script COMPLETO (base Claude) adaptado para app.py
+# ============================================================================== 
+
 import streamlit as st
 import requests
 import yfinance as yf
-from datetime import datetime, timedelta
 import pandas as pd
+import numpy as np
+import datetime
 import time
-import json
+import re
+from textblob import TextBlob
 
-# ============================
-# CONFIGURAÇÃO DA PÁGINA
-# ============================
-st.set_page_config(
-    page_title="Scanner Profissional de BDRs",
-    layout="wide"
-)
+# ===================== CONFIGURAÇÕES / CHAVES =====================
+KEYS = {
+    "BRAPI": "iExnKM1xcbQcYL3cNPhPQ3",
+    "FINNHUB": "d4uouchr01qnm7pnasq0d4uouchr01qnm7pnasqg",
+    "NEWSAPI": "ec7100fa90ef4e3f9a69a914050dd736"
+}
 
-st.title("Scanner Profissional de BDRs")
-st.caption("Eventos + Notícias + Dados | Execução diária")
+CONFIG_DEFAULT = {
+    "TOP_LIQUIDEZ": 40,
+    "DIAS_EARNINGS": 15,
+    "MIN_SCORE": 40
+}
 
-# ============================
-# CHAVES (USE SECRETS NO STREAMLIT CLOUD)
-# ============================
-FINNHUB_API_KEY = st.secrets.get("FINNHUB_API_KEY", "")
-BRAPI_API_TOKEN = st.secrets.get("BRAPI_API_TOKEN", "")
+# ===================== FUNÇÕES AUXILIARES =====================
 
-# ============================
-# PARÂMETROS (SIDEBAR)
-# ============================
-st.sidebar.header("Parâmetros")
+def obter_bdrs_brapi(top_n):
+    try:
+        url = f"https://brapi.dev/api/quote/list?token={KEYS['BRAPI']}"
+        r = requests.get(url, timeout=15)
+        df = pd.DataFrame(r.json().get('stocks', []))
+        df = df[df['stock'].str.contains(r'(31|32|33|34|35|39)$', regex=True)]
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+        df = df.sort_values('volume', ascending=False).head(top_n)
+        return df['stock'].tolist()
+    except Exception:
+        return []
 
-MIN_SCORE = st.sidebar.slider("Score mínimo", 20, 80, 20)
-MAX_BDRS = st.sidebar.slider("Quantidade de ativos", 20, 300, 100)
-EARNINGS_WINDOW = st.sidebar.slider("Janela de Earnings (dias)", 10, 60, 45)
 
-RUN = st.sidebar.button("Executar Scanner")
+def converter_ticker_us(bdr):
+    clean = bdr.replace('.SA', '')
+    us = re.sub(r'\d+$', '', clean)
+    mapa = {
+        'BERK': 'BRK-B', 'MCDC': 'MCD', 'COCA': 'KO', 'PGCO': 'PG',
+        'ROXO': 'NU', 'A1MD': 'AMD', 'LILY': 'LLY', 'H1ON': 'HON'
+    }
+    return mapa.get(us, us)
 
-# ============================
-# CLASSE PRINCIPAL
-# ============================
-class AdvancedNewsTracker:
 
-    def __init__(self):
-        self.params = {
-            'min_score': MIN_SCORE,
-            'earnings_window': EARNINGS_WINDOW,
-            'earnings_0_3': 60,
-            'earnings_4_7': 55,
-            'earnings_8_14': 50,
-            'earnings_15_30': 45,
-            'earnings_31_45': 35,
-        }
-
-    def get_bdrs_brapi(self):
-        url = f"https://brapi.dev/api/quote/list?token={BRAPI_API_TOKEN}"
-        r = requests.get(url, timeout=20)
-        df = pd.DataFrame(r.json().get("stocks", []))
-        df = df[df["stock"].str.endswith(("34", "35"))]
-        df["volume"] = pd.to_numeric(df["volume"], errors="coerce")
-        return df.sort_values("volume", ascending=False).head(MAX_BDRS)
-
-    def convert_us(self, bdr):
-        return bdr[:-2]
-
-    def get_finnhub_news(self, ticker):
-        from_date = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
-        to_date = datetime.now().strftime("%Y-%m-%d")
-
-        url = (
-            f"https://finnhub.io/api/v1/company-news?"
-            f"symbol={ticker}&from={from_date}&to={to_date}&token={FINNHUB_API_KEY}"
-        )
+def finnhub_sentiment(symbol):
+    try:
+        hoje = datetime.datetime.now()
+        de = (hoje - datetime.timedelta(days=3)).strftime('%Y-%m-%d')
+        ate = hoje.strftime('%Y-%m-%d')
+        url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={de}&to={ate}&token={KEYS['FINNHUB']}"
         r = requests.get(url, timeout=10)
-        return r.json() if r.status_code == 200 else []
-
-    def analyze(self, ticker, bdr):
         score = 0
-        events = []
+        headlines = []
+        if r.status_code == 200:
+            for n in r.json()[:5]:
+                blob = TextBlob(n.get('headline', ''))
+                score += blob.sentiment.polarity
+                headlines.append(n.get('headline', ''))
+        return score, headlines
+    except Exception:
+        return 0, []
 
-        stock = yf.Ticker(ticker)
 
-        # ===== EARNINGS CONFIRMADO =====
+# ===================== CORE DO SCANNER =====================
+
+def analisar_bdr(bdr, dias_earnings):
+    us = converter_ticker_us(bdr)
+    rep = {
+        "BDR": bdr,
+        "US": us,
+        "Score": 0,
+        "Eventos": [],
+        "Ação": "Neutro"
+    }
+
+    try:
+        stock = yf.Ticker(us)
+
+        # -------- EARNINGS (peso 50 + urgência) --------
         try:
             cal = stock.calendar
-            if isinstance(cal, pd.DataFrame) and not cal.empty:
-                dt = cal.iloc[0, 0]
-                days = (dt.to_pydatetime() - datetime.now()).days
+            earn_date = None
+            if isinstance(cal, dict) and 'Earnings Date' in cal:
+                earn_date = cal['Earnings Date'][0]
+            elif isinstance(cal, pd.DataFrame) and not cal.empty:
+                if 'Earnings Date' in cal.index:
+                    earn_date = cal.loc['Earnings Date'].iloc[0]
 
-                if 0 <= days <= self.params["earnings_window"]:
-                    if days <= 3:
-                        pts = self.params["earnings_0_3"]
-                    elif days <= 7:
-                        pts = self.params["earnings_4_7"]
-                    elif days <= 14:
-                        pts = self.params["earnings_8_14"]
-                    elif days <= 30:
-                        pts = self.params["earnings_15_30"]
-                    else:
-                        pts = self.params["earnings_31_45"]
-
-                    score += pts
-                    events.append(f"Earnings em {days} dias")
-        except:
+            if earn_date is not None:
+                if earn_date.tzinfo:
+                    earn_date = earn_date.tz_localize(None)
+                dias = (earn_date - datetime.datetime.now()).days
+                if 0 <= dias <= dias_earnings:
+                    rep['Score'] += 50
+                    rep['Eventos'].append(f"Balanço em {dias} dias")
+                    if dias <= 2:
+                        rep['Score'] += 20
+                        rep['Eventos'].append("Alta volatilidade iminente")
+        except Exception:
             pass
 
-        # ===== NOTÍCIAS =====
-        news = self.get_finnhub_news(ticker)
-        if news:
-            score += 20
-            events.append("Notícias recentes relevantes")
+        # -------- DIVIDENDOS (peso 30) --------
+        try:
+            info = stock.info
+            ex_div = info.get('exDividendDate')
+            if ex_div:
+                dt = datetime.datetime.fromtimestamp(ex_div)
+                dias_div = (dt - datetime.datetime.now()).days
+                if 0 <= dias_div <= 10:
+                    rep['Score'] += 30
+                    rep['Eventos'].append("Data Ex-Dividendo próxima")
+        except Exception:
+            pass
 
-        if score >= self.params["min_score"]:
-            price = stock.history(period="1d")["Close"].iloc[-1]
-            return {
-                "BDR": bdr,
-                "Ticker US": ticker,
-                "Score": score,
-                "Eventos": " | ".join(events),
-                "Preço US": round(price, 2)
-            }
+        # -------- NOTÍCIAS / SENTIMENTO (peso 20) --------
+        sent, heads = finnhub_sentiment(us)
+        if sent > 0.5:
+            rep['Score'] += 20
+            rep['Eventos'].append("Notícias positivas recentes")
+        elif sent < -0.5:
+            rep['Score'] -= 20
+            rep['Eventos'].append("Notícias negativas recentes")
 
-        return None
+        for h in heads:
+            if any(k in h.lower() for k in ['upgrade', 'buy', 'record', 'approval', 'merger']):
+                rep['Score'] += 10
+                rep['Eventos'].append("Notícia relevante detectada")
+                break
 
-# ============================
-# EXECUÇÃO
-# ============================
-if RUN:
+        # -------- PREÇO --------
+        hist = stock.history(period="1d")
+        if not hist.empty:
+            rep['Preço US'] = float(hist['Close'].iloc[-1])
+        else:
+            rep['Preço US'] = None
 
-    with st.spinner("Buscando BDRs mais líquidas..."):
-        bot = AdvancedNewsTracker()
-        df_bdrs = bot.get_bdrs_brapi()
+        # -------- AÇÃO FINAL --------
+        if rep['Score'] >= 70:
+            rep['Ação'] = "URGENTE"
+        elif rep['Score'] >= 50:
+            rep['Ação'] = "COMPRA / OBSERVAR"
+        elif rep['Score'] >= 30:
+            rep['Ação'] = "RADAR"
 
-    results = []
+    except Exception:
+        pass
 
+    return rep
+
+
+# ===================== INTERFACE STREAMLIT =====================
+
+st.set_page_config(page_title="Scanner Profissional de BDRs", layout="wide")
+
+st.title("Scanner Diário de BDRs")
+st.caption("Eventos + Notícias + Score Fundamental | Execução diária")
+
+with st.sidebar:
+    st.header("Parâmetros")
+    min_score = st.slider("Score mínimo", 30, 90, CONFIG_DEFAULT['MIN_SCORE'])
+    qtd_bdrs = st.slider("Quantidade de BDRs analisadas", 20, 150, CONFIG_DEFAULT['TOP_LIQUIDEZ'])
+    dias_earn = st.slider("Dias para Earnings", 5, 30, CONFIG_DEFAULT['DIAS_EARNINGS'])
+    executar = st.button("Executar Scanner")
+
+if executar:
+    st.info("Buscando BDRs mais líquidas...")
+    lista = obter_bdrs_brapi(qtd_bdrs)
+
+    resultados = []
     progress = st.progress(0)
-    for i, row in df_bdrs.iterrows():
-        progress.progress((len(results)+1)/len(df_bdrs))
-        us = bot.convert_us(row["stock"])
-        r = bot.analyze(us, row["stock"])
-        if r:
-            results.append(r)
-        time.sleep(0.2)
 
-    st.success(f"{len(results)} oportunidades encontradas")
+    for i, bdr in enumerate(lista):
+        res = analisar_bdr(bdr, dias_earn)
+        if res['Score'] >= min_score:
+            resultados.append(res)
+        progress.progress((i + 1) / len(lista))
 
-    if results:
-        df = pd.DataFrame(results).sort_values("Score", ascending=False)
+    if resultados:
+        df = pd.DataFrame(resultados).sort_values('Score', ascending=False)
+        st.success(f"{len(df)} oportunidades encontradas")
         st.dataframe(df, use_container_width=True)
     else:
-        st.warning("Nenhuma oportunidade encontrada com os filtros atuais.")
+        st.warning("Nenhum ativo passou nos filtros definidos")
