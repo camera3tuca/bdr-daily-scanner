@@ -1,193 +1,232 @@
-# ==============================================================================
-# SCANNER PROFISSIONAL DE BDRs – STREAMLIT
-# Tendência + Momentum + Volume + Eventos + Notícias
-# Script COMPLETO (base Claude) adaptado para app.py
-# ============================================================================== 
+# ===================================================================
+# SCANNER PROFISSIONAL DE NOTÍCIAS BDR
+# Tendência + Eventos + Qualidade + Urgência
+# Estilo Plataforma Paga | Streamlit Cloud
+# ===================================================================
 
 import streamlit as st
 import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
-import datetime
+import json
 import time
-import re
-from textblob import TextBlob
+from datetime import datetime, timedelta
 
-# ===================== CONFIGURAÇÕES / CHAVES =====================
-KEYS = {
-    "BRAPI": "iExnKM1xcbQcYL3cNPhPQ3",
-    "FINNHUB": "d4uouchr01qnm7pnasq0d4uouchr01qnm7pnasqg",
-    "NEWSAPI": "ec7100fa90ef4e3f9a69a914050dd736"
+# =========================
+# CONFIGURAÇÕES (CHAVES)
+# =========================
+FINNHUB_API_KEY = "d4uouchr01qnm7pnasq0d4uouchr01qnm7pnasqg"
+NEWS_API_KEY = "ec7100fa90ef4e3f9a69a914050dd736"
+BRAPI_API_TOKEN = "iExnKM1xcbQcYL3cNPhPQ3"
+
+# =========================
+# PARÂMETROS OTIMIZADOS
+# =========================
+PARAMS = {
+    "stop_loss": 0.03,
+    "take_profit": 0.15,
+    "hold_days": 5,
+    "min_score": 20,
+
+    "earnings_scores": {
+        "0_3": 60,
+        "4_7": 55,
+        "8_14": 50,
+        "15_30": 45,
+        "31_45": 35
+    },
+    "dividend_scores": {
+        "0_1": 50,
+        "2_5": 45,
+        "6_10": 40,
+        "11_20": 35,
+        "21_30": 30
+    }
 }
 
-CONFIG_DEFAULT = {
-    "TOP_LIQUIDEZ": 40,
-    "DIAS_EARNINGS": 15,
-    "MIN_SCORE": 40
-}
+TRUSTED_SOURCES = [
+    "reuters", "bloomberg", "cnbc", "marketwatch",
+    "wsj", "financial times", "barrons", "yahoo finance"
+]
 
-# ===================== FUNÇÕES AUXILIARES =====================
+# =========================
+# FUNÇÕES AUXILIARES
+# =========================
+@st.cache_data(ttl=86400)
+def load_bdr_mapping():
+    url = f"https://brapi.dev/api/quote/list?token={BRAPI_API_TOKEN}"
+    r = requests.get(url, timeout=30)
+    data = r.json().get("stocks", [])
+    mapping = {}
+    for s in data:
+        t = s.get("stock", "")
+        if t.endswith(("34", "35")):
+            mapping[t[:-2]] = t
+    return mapping
 
-def obter_bdrs_brapi(top_n):
+def get_news_finnhub(ticker):
+    d1 = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+    d2 = datetime.now().strftime("%Y-%m-%d")
+    url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={d1}&to={d2}&token={FINNHUB_API_KEY}"
     try:
-        url = f"https://brapi.dev/api/quote/list?token={KEYS['BRAPI']}"
-        r = requests.get(url, timeout=15)
-        df = pd.DataFrame(r.json().get('stocks', []))
-        df = df[df['stock'].str.contains(r'(31|32|33|34|35|39)$', regex=True)]
-        df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-        df = df.sort_values('volume', ascending=False).head(top_n)
-        return df['stock'].tolist()
-    except Exception:
+        r = requests.get(url, timeout=10)
+        return r.json() if r.status_code == 200 else []
+    except:
         return []
 
-
-def converter_ticker_us(bdr):
-    clean = bdr.replace('.SA', '')
-    us = re.sub(r'\d+$', '', clean)
-    mapa = {
-        'BERK': 'BRK-B', 'MCDC': 'MCD', 'COCA': 'KO', 'PGCO': 'PG',
-        'ROXO': 'NU', 'A1MD': 'AMD', 'LILY': 'LLY', 'H1ON': 'HON'
-    }
-    return mapa.get(us, us)
-
-
-def finnhub_sentiment(symbol):
+def get_yahoo_data(ticker):
     try:
-        hoje = datetime.datetime.now()
-        de = (hoje - datetime.timedelta(days=3)).strftime('%Y-%m-%d')
-        ate = hoje.strftime('%Y-%m-%d')
-        url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={de}&to={ate}&token={KEYS['FINNHUB']}"
-        r = requests.get(url, timeout=10)
-        score = 0
-        headlines = []
-        if r.status_code == 200:
-            for n in r.json()[:5]:
-                blob = TextBlob(n.get('headline', ''))
-                score += blob.sentiment.polarity
-                headlines.append(n.get('headline', ''))
-        return score, headlines
-    except Exception:
-        return 0, []
+        t = yf.Ticker(ticker)
+        info = t.info
+        cal = t.calendar
+        earnings_date = None
+        if isinstance(cal, pd.DataFrame) and not cal.empty:
+            earnings_date = cal.iloc[0, 0]
+        return {
+            "news": t.news or [],
+            "earnings_date": earnings_date,
+            "ex_div": info.get("exDividendDate"),
+            "div_yield": info.get("dividendYield")
+        }
+    except:
+        return {"news": [], "earnings_date": None, "ex_div": None, "div_yield": None}
 
+def assess_quality(news):
+    title = (news.get("headline") or news.get("title") or "").lower()
+    source = (news.get("source") or news.get("publisher") or "").lower()
+    url = (news.get("url") or "").lower()
 
-# ===================== CORE DO SCANNER =====================
+    score = 0
+    reasons = []
 
-def analisar_bdr(bdr, dias_earnings):
-    us = converter_ticker_us(bdr)
-    rep = {
-        "BDR": bdr,
-        "US": us,
-        "Score": 0,
-        "Eventos": [],
-        "Ação": "Neutro"
+    if any(s in source or s in url for s in TRUSTED_SOURCES):
+        score += 20
+        reasons.append("Fonte confiável")
+
+    if any(w in title for w in ["announces", "reports", "confirms"]):
+        score += 15
+        reasons.append("Evento confirmado")
+
+    if any(w in title for w in ["rumor", "may", "could", "might"]):
+        score -= 10
+        reasons.append("Possível rumor")
+
+    return score, reasons
+
+def classify_events(news, yahoo):
+    text = f"{news.get('headline','')} {news.get('summary','')}".lower()
+    events = []
+    score = 0
+
+    patterns = {
+        "earnings": ["earnings", "results"],
+        "guidance": ["guidance", "outlook"],
+        "dividend": ["dividend"],
+        "merger": ["merger", "acquisition"],
+        "product": ["launch", "unveil"]
     }
 
-    try:
-        stock = yf.Ticker(us)
+    for etype, kws in patterns.items():
+        if any(k in text for k in kws):
+            events.append(f"{etype.title()} anunciado")
+            score += 30
 
-        # -------- EARNINGS (peso 50 + urgência) --------
-        try:
-            cal = stock.calendar
-            earn_date = None
-            if isinstance(cal, dict) and 'Earnings Date' in cal:
-                earn_date = cal['Earnings Date'][0]
-            elif isinstance(cal, pd.DataFrame) and not cal.empty:
-                if 'Earnings Date' in cal.index:
-                    earn_date = cal.loc['Earnings Date'].iloc[0]
+    ed = yahoo.get("earnings_date")
+    if isinstance(ed, (datetime, pd.Timestamp)):
+        days = (ed - datetime.now()).days
+        if -2 <= days <= 45:
+            if days <= 3:
+                boost = PARAMS["earnings_scores"]["0_3"]
+            elif days <= 7:
+                boost = PARAMS["earnings_scores"]["4_7"]
+            elif days <= 14:
+                boost = PARAMS["earnings_scores"]["8_14"]
+            elif days <= 30:
+                boost = PARAMS["earnings_scores"]["15_30"]
+            else:
+                boost = PARAMS["earnings_scores"]["31_45"]
+            events.append(f"📅 Earnings em {days}d")
+            score += boost
 
-            if earn_date is not None:
-                if earn_date.tzinfo:
-                    earn_date = earn_date.tz_localize(None)
-                dias = (earn_date - datetime.datetime.now()).days
-                if 0 <= dias <= dias_earnings:
-                    rep['Score'] += 50
-                    rep['Eventos'].append(f"Balanço em {dias} dias")
-                    if dias <= 2:
-                        rep['Score'] += 20
-                        rep['Eventos'].append("Alta volatilidade iminente")
-        except Exception:
-            pass
+    ex = yahoo.get("ex_div")
+    dy = yahoo.get("div_yield")
+    if ex and dy:
+        d = (datetime.fromtimestamp(ex) - datetime.now()).days
+        if -2 <= d <= 30:
+            events.append(f"💰 Ex-Div em {d}d")
+            score += 40
 
-        # -------- DIVIDENDOS (peso 30) --------
-        try:
-            info = stock.info
-            ex_div = info.get('exDividendDate')
-            if ex_div:
-                dt = datetime.datetime.fromtimestamp(ex_div)
-                dias_div = (dt - datetime.datetime.now()).days
-                if 0 <= dias_div <= 10:
-                    rep['Score'] += 30
-                    rep['Eventos'].append("Data Ex-Dividendo próxima")
-        except Exception:
-            pass
+    return events, score
 
-        # -------- NOTÍCIAS / SENTIMENTO (peso 20) --------
-        sent, heads = finnhub_sentiment(us)
-        if sent > 0.5:
-            rep['Score'] += 20
-            rep['Eventos'].append("Notícias positivas recentes")
-        elif sent < -0.5:
-            rep['Score'] -= 20
-            rep['Eventos'].append("Notícias negativas recentes")
+def priority(score):
+    if score >= 70:
+        return "🔴 URGENTE"
+    if score >= 50:
+        return "🟠 ALTA"
+    if score >= 30:
+        return "🟡 MÉDIA"
+    return "⚪ BAIXA"
 
-        for h in heads:
-            if any(k in h.lower() for k in ['upgrade', 'buy', 'record', 'approval', 'merger']):
-                rep['Score'] += 10
-                rep['Eventos'].append("Notícia relevante detectada")
-                break
+def recommendation(score):
+    if score >= 70:
+        return "🔴 COMPRAR AGORA"
+    if score >= 50:
+        return "🟠 MONITORAR ENTRADA"
+    return "🟡 OBSERVAR"
 
-        # -------- PREÇO --------
-        hist = stock.history(period="1d")
-        if not hist.empty:
-            rep['Preço US'] = float(hist['Close'].iloc[-1])
-        else:
-            rep['Preço US'] = None
+# =========================
+# INTERFACE STREAMLIT
+# =========================
+st.set_page_config("Scanner Diário de BDRs", layout="wide")
+st.title("📊 Scanner Profissional de Notícias BDR")
+st.caption("Tendência + Eventos + Qualidade + Urgência")
 
-        # -------- AÇÃO FINAL --------
-        if rep['Score'] >= 70:
-            rep['Ação'] = "URGENTE"
-        elif rep['Score'] >= 50:
-            rep['Ação'] = "COMPRA / OBSERVAR"
-        elif rep['Score'] >= 30:
-            rep['Ação'] = "RADAR"
+min_score = st.slider("Score mínimo", 20, 90, 40)
+max_assets = st.slider("Quantidade de BDRs analisadas", 50, 150, 100)
 
-    except Exception:
-        pass
+st.info("🔍 Buscando BDRs via Brapi...")
+bdr_map = load_bdr_mapping()
+tickers = list(bdr_map.keys())[:max_assets]
+st.success(f"✅ {len(bdr_map)} BDRs mapeados")
 
-    return rep
+results = []
+progress = st.progress(0.0)
 
+for i, tk in enumerate(tickers, 1):
+    progress.progress(i / len(tickers))
+    yahoo = get_yahoo_data(tk)
+    news_all = get_news_finnhub(tk) + yahoo["news"]
 
-# ===================== INTERFACE STREAMLIT =====================
+    for n in news_all[:5]:
+        q_score, q_reasons = assess_quality(n)
+        ev, ev_score = classify_events(n, yahoo)
+        final = ev_score + q_score
 
-st.set_page_config(page_title="Scanner Profissional de BDRs", layout="wide")
+        if ev and final >= min_score:
+            results.append({
+                "Ticker": tk,
+                "BDR": bdr_map.get(tk, "N/A"),
+                "Score": final,
+                "Prioridade": priority(final),
+                "Eventos": " | ".join(ev),
+                "Qualidade": ", ".join(q_reasons) or "Padrão",
+                "Ação": recommendation(final),
+                "Notícia": n.get("headline") or n.get("title")
+            })
+    time.sleep(0.2)
 
-st.title("Scanner Diário de BDRs")
-st.caption("Eventos + Notícias + Score Fundamental | Execução diária")
+df = pd.DataFrame(results).sort_values("Score", ascending=False)
 
-with st.sidebar:
-    st.header("Parâmetros")
-    min_score = st.slider("Score mínimo", 30, 90, CONFIG_DEFAULT['MIN_SCORE'])
-    qtd_bdrs = st.slider("Quantidade de BDRs analisadas", 20, 150, CONFIG_DEFAULT['TOP_LIQUIDEZ'])
-    dias_earn = st.slider("Dias para Earnings", 5, 30, CONFIG_DEFAULT['DIAS_EARNINGS'])
-    executar = st.button("Executar Scanner")
+st.subheader("🎯 Oportunidades Detectadas")
+st.dataframe(df, use_container_width=True)
 
-if executar:
-    st.info("Buscando BDRs mais líquidas...")
-    lista = obter_bdrs_brapi(qtd_bdrs)
+urgent = df[df["Prioridade"].str.contains("🔴")]
+if not urgent.empty:
+    st.error("🚨 ALERTAS URGENTES")
+    st.table(urgent[["Ticker", "Score", "Eventos", "Ação"]])
 
-    resultados = []
-    progress = st.progress(0)
+with open("tracking.json", "w") as f:
+    json.dump(results, f, indent=2)
 
-    for i, bdr in enumerate(lista):
-        res = analisar_bdr(bdr, dias_earn)
-        if res['Score'] >= min_score:
-            resultados.append(res)
-        progress.progress((i + 1) / len(lista))
-
-    if resultados:
-        df = pd.DataFrame(resultados).sort_values('Score', ascending=False)
-        st.success(f"{len(df)} oportunidades encontradas")
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.warning("Nenhum ativo passou nos filtros definidos")
+st.success("✅ Sistema completo ativo")
