@@ -2,4 +2,5 @@ streamlit
 requests
 yfinance
 pandas
-numpy
+textblob
+deep-translator
