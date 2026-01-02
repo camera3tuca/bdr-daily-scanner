@@ -9,21 +9,20 @@ from textblob import TextBlob
 from deep_translator import GoogleTranslator
 
 # --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Scanner Diário de BDRs", page_icon="🚀", layout="wide")
+st.set_page_config(page_title="Scanner Pro BDRs", page_icon="💹", layout="wide")
 
-# --- SEGREDOS (Carregados do Streamlit Cloud ou Padrão) ---
+# --- SEGREDOS ---
 FINNHUB_KEY = st.secrets.get("FINNHUB_API_KEY", "d4uouchr01qnm7pnasq0d4uouchr01qnm7pnasqg")
-NEWS_KEY = st.secrets.get("NEWS_API_KEY", "ec7100fa90ef4e3f9a69a914050dd736")
 BRAPI_TOKEN = st.secrets.get("BRAPI_API_TOKEN", "iExnKM1xcbQcYL3cNPhPQ3")
 
 # --- CLASSE MONITOR ---
 class SwingTradeMonitor:
     def __init__(self):
+        # Instancia o tradutor
         self.translator = GoogleTranslator(source='auto', target='pt')
         self.ticker_map = self._carregar_mapa_bdr_us()
         
     def _carregar_mapa_bdr_us(self):
-        # Mapeamento manual para garantir precisão
         return {
             'AAPL': 'AAPL34', 'MSFT': 'MSFT34', 'GOOGL': 'GOGL34', 'AMZN': 'AMZO34', 
             'NVDA': 'NVDC34', 'TSLA': 'TSLA34', 'META': 'FBOK34', 'NFLX': 'NFLX34',
@@ -37,12 +36,12 @@ class SwingTradeMonitor:
         }
 
     def traduzir(self, texto):
-        """Traduz texto para PT-BR com cache simples para não travar"""
-        if not texto or len(texto) < 3: return texto
+        """Traduz texto para PT-BR com tratamento de erro"""
+        if not texto or len(texto) < 3: return ""
         try:
             return self.translator.translate(texto)
         except:
-            return texto # Retorna original se falhar
+            return texto # Retorna original se falhar a API de tradução
 
     def obter_bdrs_brapi(self, limite=50):
         try:
@@ -52,61 +51,58 @@ class SwingTradeMonitor:
             df = pd.DataFrame(data)
             df = df[df['stock'].str.contains(r'(31|32|33|34|35|39)$')]
             df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
-            # Retorna lista de BDRs ordenados por volume
             return df.sort_values('volume', ascending=False).head(limite)['stock'].tolist()
         except:
-            # Fallback se Brapi falhar: usa o mapa manual
             return list(self.ticker_map.values())
 
     def converter_para_us(self, bdr):
-        """Tenta reverter BDR para Ticker US"""
         bdr_clean = bdr.replace('.SA', '')
-        # Tenta achar no mapa reverso
         for us, br in self.ticker_map.items():
             if br == bdr_clean: return us
-        # Tenta regra geral
         return re.sub(r'\d+$', '', bdr_clean)
 
     def get_yahoo_data(self, ticker_us):
-        """Busca dados fundamentais (Earnings/Dividendos)"""
         try:
             stock = yf.Ticker(ticker_us)
-            
-            # Tenta pegar dados rápidos
             try: cal = stock.calendar; earn_date = cal.get('Earnings Date', [None])[0] if cal else None
             except: earn_date = None
-            
             try: info = stock.info; ex_div = info.get('exDividendDate'); div_yield = info.get('dividendYield')
             except: ex_div, div_yield = None, None
             
-            # Pega histórico para tendência
             hist = stock.history(period='1mo')
             trend = "Lateral"
-            if len(hist) > 20:
+            price = 0
+            if not hist.empty:
+                price = hist['Close'].iloc[-1]
                 sma20 = hist['Close'].mean()
-                atual = hist['Close'].iloc[-1]
-                trend = "Alta 📈" if atual > sma20 else "Baixa 📉"
+                trend = "Alta 📈" if price > sma20 else "Baixa 📉"
             
-            return {
-                'earnings': earn_date,
-                'ex_div': ex_div,
-                'yield': div_yield,
-                'trend': trend,
-                'price': hist['Close'].iloc[-1] if not hist.empty else 0
-            }
-        except:
-            return None
+            return {'earnings': earn_date, 'ex_div': ex_div, 'yield': div_yield, 'trend': trend, 'price': price}
+        except: return None
 
     def get_news(self, ticker_us):
-        """Busca notícias recentes no Finnhub"""
         try:
-            # Pega notícias dos últimos 3 dias
             hj = datetime.now().strftime('%Y-%m-%d')
             inicio = (datetime.now() - timedelta(days=3)).strftime('%Y-%m-%d')
             url = f'https://finnhub.io/api/v1/company-news?symbol={ticker_us}&from={inicio}&to={hj}&token={FINNHUB_KEY}'
             r = requests.get(url, timeout=5)
             return r.json() if r.status_code == 200 else []
         except: return []
+
+    def gerar_analise_compra(self, gatilho, score):
+        """Gera a explicação do porquê comprar"""
+        if "Balanço" in gatilho:
+            return "Alta volatilidade esperada. Oportunidade de captura de movimento forte pós-resultado."
+        elif "Data Com" in gatilho:
+            return "Entrada estratégica para garantir o recebimento de dividendos (Yield atraente)."
+        elif "Upgrade" in gatilho or "Buy" in gatilho:
+            return "Bancos e analistas revisaram a nota para cima, indicando fluxo comprador institucional."
+        elif "Record" in gatilho or "Growth" in gatilho:
+            return "Empresa reportando crescimento ou recordes, validando a tendência de alta."
+        elif "Approval" in gatilho:
+            return "Aprovação regulatória (ex: FDA) destrava valor fundamental na ação."
+        else:
+            return "Fluxo de notícias extremamente positivo sugere otimismo do mercado."
 
     def analisar_ativo(self, bdr):
         ticker_us = self.converter_para_us(bdr)
@@ -120,139 +116,153 @@ class SwingTradeMonitor:
         score = 0
         eventos = []
         manchete_top = ""
+        resumo_top = ""
+        fonte_top = ""
         link_top = ""
+        gatilho_principal = ""
         
-        # 1. Análise de Earnings (50 pts)
+        # 1. Earnings (50 pts)
         if y_data['earnings']:
             dias = (pd.to_datetime(y_data['earnings']).replace(tzinfo=None) - datetime.now()).days
             if 0 <= dias <= 15:
                 score += 50
-                urgencia = "🔥 AMANHÃ" if dias <= 1 else f"em {dias}d"
-                eventos.append(f"Balanço {urgencia}")
+                gatilho_principal = "Balanço Próximo"
+                eventos.append(f"Balanço em {dias}d")
         
-        # 2. Análise de Dividendos (30 pts)
+        # 2. Dividendos (30 pts)
         if y_data['ex_div']:
             dias = (datetime.fromtimestamp(y_data['ex_div']) - datetime.now()).days
             if 0 <= dias <= 10:
                 score += 30
-                yield_fmt = f"{(y_data['yield']*100):.1f}%" if y_data['yield'] else "?"
-                eventos.append(f"Data Com (Div) em {dias}d (Y: {yield_fmt})")
+                if not gatilho_principal: gatilho_principal = "Data Com (Dividendos)"
+                y_val = f"{(y_data['yield']*100):.1f}%" if y_data['yield'] else "?"
+                eventos.append(f"Div (Y: {y_val})")
 
-        # 3. Análise de Notícias (até 20 pts)
-        # Analisa até 15 notícias (pedido do usuário)
+        # 3. Notícias (até 20 pts)
+        keyword_map = {
+            'upgrade': 'Upgrade de Analista', 'buy': 'Recomendação de Compra', 
+            'record': 'Recorde Histórico', 'growth': 'Crescimento', 
+            'approval': 'Aprovação Regulatória', 'soar': 'Disparada', 'jump': 'Salto'
+        }
+
         for n in noticias[:15]:
             texto = f"{n['headline']} {n['summary']}".lower()
             
-            # Palavras-chave positivas
-            if any(x in texto for x in ['upgrade', 'buy', 'record', 'growth', 'dividend', 'soar', 'jump']):
-                blob = TextBlob(texto)
-                if blob.sentiment.polarity > 0.1:
-                    score += 5
-                    if not manchete_top:
-                        manchete_top = n['headline']
-                        link_top = n['url']
+            for k, v in keyword_map.items():
+                if k in texto:
+                    blob = TextBlob(texto)
+                    if blob.sentiment.polarity > 0.1:
+                        score += 5
+                        if not manchete_top:
+                            manchete_top = n['headline']
+                            resumo_top = n['summary']
+                            fonte_top = n.get('source', 'Finnhub')
+                            link_top = n['url']
+                            if not gatilho_principal: gatilho_principal = v
             
-            if score >= 60: break # Teto de score por notícias
+            if score >= 80: break
 
-        # Definição de Ação
-        if score >= 60: acao = "COMPRAR AGORA 🔴"
-        elif score >= 40: acao = "MONITORAR 🟠"
-        elif score >= 20: acao = "RADAR 🟡"
-        else: return None # Filtra o que não é interessante
+        if score < 20: return None 
 
-        # Traduz a manchete se houver
+        acao = "COMPRAR AGORA 🔴" if score >= 60 else "MONITORAR 🟠" if score >= 40 else "OBSERVAR 🟡"
+        
+        # Tradução Final
         if manchete_top:
             manchete_top = self.traduzir(manchete_top)
+            if resumo_top:
+                resumo_top = self.traduzir(resumo_top)
+        else:
+            manchete_top = "Movimento técnico/fundamental detectado"
+            resumo_top = "Nenhuma notícia específica recente, mas indicadores técnicos ou calendário apontam oportunidade."
+            fonte_top = "Análise Técnica"
+
+        analise_robo = self.gerar_analise_compra(gatilho_principal, score)
 
         return {
             "BDR": bdr,
             "US": ticker_us,
-            "Preço (US)": y_data['price'],
+            "Preço": y_data['price'],
             "Tendência": y_data['trend'],
-            "Score": min(score, 100), # Teto 100
+            "Score": min(score, 100),
             "Ação": acao,
-            "Motivo": ", ".join(eventos) if eventos else "Fluxo de Notícias Positivo",
             "Manchete": manchete_top,
-            "Link": link_top
+            "Resumo": resumo_top,
+            "Fonte": fonte_top,
+            "Link": link_top,
+            "Análise": analise_robo,
+            "Gatilho": gatilho_principal if gatilho_principal else "Fluxo Positivo"
         }
 
-# --- INTERFACE STREAMLIT ---
+# --- INTERFACE ---
+st.title("🌐 Scanner BDR: Notícias & Oportunidades")
+st.markdown("### Monitoramento Fundamentalista em Tempo Real (PT-BR)")
 
-st.title("🇧🇷 Scanner Pro de BDRs: Oportunidades de Compra")
-st.markdown("""
-Monitora **Eventos Corporativos** (Balanços, Dividendos) e **Notícias Otimistas** traduzidas para o português.
-Foca apenas no que está quente para Swing Trade.
-""")
+with st.sidebar:
+    st.header("Filtros")
+    qtd = st.slider("Ativos para analisar:", 10, 60, 30)
+    filtro_score = st.slider("Score Mínimo:", 0, 50, 20)
 
-col1, col2 = st.columns(2)
-qtd_bdrs = col1.slider("Quantidade de BDRs para analisar:", 10, 80, 40)
-score_min = col2.slider("Score Mínimo (Sensibilidade):", 10, 50, 20)
-
-if st.button("🔍 Iniciar Varredura de Mercado", type="primary"):
+if st.button("🚀 Iniciar Scanner", type="primary"):
     monitor = SwingTradeMonitor()
-    
-    # 1. Obter Lista
     status = st.empty()
-    status.info("Obtendo lista atualizada da B3...")
-    bdrs = monitor.obter_bdrs_brapi(qtd_bdrs)
+    bar = st.progress(0)
     
-    # 2. Loop de Análise
+    status.info("Buscando lista de BDRs...")
+    bdrs = monitor.obter_bdrs_brapi(qtd)
+    
     resultados = []
-    progresso = st.progress(0)
     
     for i, bdr in enumerate(bdrs):
-        pct = (i+1)/len(bdrs)
-        progresso.progress(pct)
-        status.text(f"Analisando {bdr} ({i+1}/{len(bdrs)})... Traduzindo notícias...")
-        
+        bar.progress((i+1)/len(bdrs))
+        status.text(f"Analisando {bdr}... Traduzindo dados...")
         try:
             res = monitor.analisar_ativo(bdr)
-            if res and res['Score'] >= score_min:
+            if res and res['Score'] >= filtro_score:
                 resultados.append(res)
-        except Exception as e:
-            continue
+        except: continue
             
-    progresso.empty()
+    bar.empty()
     status.empty()
     
-    # 3. Exibição dos Resultados
     if resultados:
         df = pd.DataFrame(resultados)
+        df = df.sort_values(['Score'], ascending=False)
         
-        # Ordenação inteligente
-        df = df.sort_values(['Score', 'Preço (US)'], ascending=[False, False])
+        st.success(f"{len(df)} Oportunidades encontradas!")
         
-        st.success(f"✅ {len(df)} Oportunidades Encontradas!")
-        
-        # Configuração da Tabela Profissional
+        # TABELA RESUMIDA
+        st.subheader("📋 Tabela Geral")
         st.data_editor(
-            df,
+            df[['BDR', 'Preço', 'Score', 'Ação', 'Manchete', 'Fonte', 'Link']],
             column_config={
-                "Link": st.column_config.LinkColumn(
-                    "Fonte", display_text="Ler Notícia"
-                ),
-                "Score": st.column_config.ProgressColumn(
-                    "Força (0-100)",
-                    format="%d",
-                    min_value=0,
-                    max_value=100,
-                ),
-                "Preço (US)": st.column_config.NumberColumn(
-                    "Preço (US$)",
-                    format="$ %.2f"
-                ),
-                "BDR": st.column_config.TextColumn("Ativo BR"),
+                "Link": st.column_config.LinkColumn("Ver", display_text="Original"),
+                "Score": st.column_config.ProgressColumn("Força", format="%d", min_value=0, max_value=100),
+                "Preço": st.column_config.NumberColumn("Preço ($)", format="$ %.2f"),
+                "Manchete": st.column_config.TextColumn("Última Notícia (Traduzida)", width="large"),
             },
             hide_index=True,
-            use_container_width=True,
-            height=500
+            use_container_width=True
         )
         
-        # Área de Destaques (Texto)
-        st.markdown("### 📝 Resumo Executivo")
-        tops = df.head(3)
-        for _, row in tops.iterrows():
-            st.info(f"**{row['BDR']} ({row['US']})**: {row['Ação']} - {row['Motivo']}. \n\n*Notícia: {row['Manchete']}*")
+        # DETALHES EXPANDIDOS (CARTÕES)
+        st.markdown("---")
+        st.subheader("🕵️‍♂️ Detalhes das Oportunidades (Análise Profunda)")
+        
+        for index, row in df.iterrows():
+            cor_card = "red" if "COMPRAR" in row['Ação'] else "orange" if "MONITORAR" in row['Ação'] else "blue"
             
+            with st.expander(f"{row['BDR']} ({row['US']}) - {row['Ação']} (Score: {row['Score']})", expanded=(index < 2)):
+                c1, c2 = st.columns([2, 1])
+                
+                with c1:
+                    st.markdown(f"**📢 Notícia:** {row['Manchete']}")
+                    st.caption(f"Fonte: {row['Fonte']}")
+                    st.info(f"**Resumo:** {row['Resumo']}")
+                    
+                with c2:
+                    st.markdown(f"**🎯 Por que é compra?**")
+                    st.write(f"_{row['Análise']}_")
+                    st.metric("Tendência", row['Tendência'])
+                    st.markdown(f"[Ler notícia original]({row['Link']})")
     else:
-        st.warning("Nenhuma oportunidade relevante encontrada com os filtros atuais.")
+        st.warning("Nenhuma oportunidade encontrada.")
